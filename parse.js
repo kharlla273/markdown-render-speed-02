@@ -1831,7 +1831,12 @@ function parseInline(src, refs, st) {
         flush();
         nodes.push({ t: 'html', s: html });
         const low = html.toLowerCase();
-        if (/^<a(\s|\/?>)/.test(low)) st.inAnchor = true;
+        // An anchor opens the inAnchor state only when the tag starts
+        // with '<a ' (literal space after 'a'): oracle-probed, plain
+        // '<a>' and '<a/>' do NOT suppress later autolinks, nor do
+        // '<a\t/>' or '<a\n/>'; '<a />', '<a href=x>' and '<a href=x/>'
+        // do. The state persists across paragraphs until '</a>'.
+        if (/^<a /.test(low)) st.inAnchor = true;
         else if (/^<\/a(\s|>)/.test(low)) st.inAnchor = false;
         i += html.length;
         continue;
