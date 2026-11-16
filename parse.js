@@ -238,6 +238,65 @@ function parseLinkLabel(s, i) {
   return null;
 }
 
+// H3-final backtick rule for link labels (oracle-probed): count the
+// backtick runs in the label (backslash-escaped backticks don't count;
+// runs pair up adjacently, length-agnostic). The label is valid iff the
+// run count is even, or the count is odd with the last run of length
+// >= 2 sitting at the very end of the label.
+function labelBackticksValid(label) {
+  let count = 0;
+  let lastLen = 0;
+  let lastEnd = -1;
+  for (let k = 0; k < label.length; k++) {
+    if (label[k] === '\\' && k + 1 < label.length && isPunct(label[k + 1])) { k++; continue; }
+    if (label[k] === '`') {
+      let e = k;
+      while (e < label.length && label[e] === '`') e++;
+      count++;
+      lastLen = e - k;
+      lastEnd = e;
+      k = e - 1;
+    }
+  }
+  if (count % 2 === 0) return true;
+  return lastLen >= 2 && lastEnd === label.length;
+}
+
+// Does a valid link tail start at s[p] (the char after a ']' whose label
+// is `label`)? Mirrors the ']' handler: inline tail (with shortcut
+// fallback on failure), full/collapsed ref tail, or shortcut ref.
+function linkTailAfter(s, p, label, refs) {
+  const n = s.length;
+  if (s[p] === '(') {
+    let q = p + 1;
+    while (q < n && (s[q] === ' ' || s[q] === '\t' || s[q] === '\n')) q++;
+    let dest = null;
+    const dRes = parseLinkDest(s, q);
+    if (dRes) { dest = dRes[0]; q = dRes[1]; }
+    else if (q < n && (s[q] === ')' || s[q] === '"' || s[q] === "'" || s[q] === '(')) dest = '';
+    if (dest !== null) {
+      let t = q;
+      while (t < n && (s[t] === ' ' || s[t] === '\t' || s[t] === '\n')) t++;
+      if (t < n && (s[t] === '"' || s[t] === "'" || s[t] === '(')) {
+        const tRes = parseLinkTitle(s, t);
+        if (tRes) t = tRes[1];
+      }
+      while (t < n && (s[t] === ' ' || s[t] === '\t' || s[t] === '\n')) t++;
+      if (t < n && s[t] === ')') return true;
+    }
+    return !!refs[normalizeLabel(label)];
+  }
+  if (s[p] === '[') {
+    const lab = parseLinkLabel(s, p);
+    if (lab) {
+      const ref = refs[normalizeLabel(lab[0] === '' ? label : lab[0])];
+      return !!ref;
+    }
+    return false;
+  }
+  return !!refs[normalizeLabel(label)];
+}
+
 // ---------- URL handling ----------
 function encodeHref(url) {
   let enc;
@@ -1371,10 +1430,31 @@ function processEmphasis(nodes, delims, startIdx, endIdx) {
     const idx = nodes.indexOf(d.node);
     return idx >= startIdx && idx < endIdx;
   };
-  const ghosts = []; // {node, origLen, ch}
+  // Consumed pairs from matches made in this pass: {oNode, cNode,
+  // oCanClose, cCanOpen, cOrigLen, ch}. A consumed pair blocks a later
+  // single-use match spanning it when its opener cannot close, its
+  // closer can open, and (its closer's original length is >= 2, or the
+  // prospective sum is a multiple of 3 with the closer no longer than
+  // the consumed closer's original length).
+  const consumed = [];
+  const pairBlocks = (opener, closer, oIdx, cIdx, sum) => {
+    const use = (opener.len >= 2 && closer.len >= 2) ? 2 : 1;
+    if (use !== 1) return false;
+    for (const p of consumed) {
+      if (p.ch !== closer.ch) continue;
+      if (p.oCanClose || !p.cCanOpen) continue;
+      const oi = nodes.indexOf(p.oNode);
+      const ci = nodes.indexOf(p.cNode);
+      if (oi > oIdx && oi < cIdx && ci > oIdx && ci < cIdx) {
+        if (p.cOrigLen >= 2) return true;
+        if (sum % 3 === 0 && closer.len <= p.cOrigLen) return true;
+      }
+    }
+    return false;
+  };
   // Iterate closers by position; re-scan after each pass since wrapping
   // changes indices. Use a work list of closer entries sorted by position.
-  let closers = delims.filter(d => d.canClose && d.len > 0 && inRange(d));
+  let closers = delims.filter(d => d.canClose && d.len > 0 && !d.suppressed && inRange(d));
   closers.sort((a, b) => nodes.indexOf(a.node) - nodes.indexOf(b.node));
   for (const closer of closers) {
     if (closer.len <= 0) continue;
@@ -1389,7 +1469,7 @@ function processEmphasis(nodes, delims, startIdx, endIdx) {
       // '~' delimiters only match equal lengths.
       for (let k = delims.length - 1; k >= 0; k--) {
         const d = delims[k];
-        if (d === closer || d.ch !== closer.ch || !d.canOpen || d.len <= 0) continue;
+        if (d === closer || d.ch !== closer.ch || !d.canOpen || d.len <= 0 || d.suppressed) continue;
         if (d.ch === '~' && d.len !== closer.len) continue;
         const di = nodes.indexOf(d.node);
         if (di < startIdx || di >= cIdx) continue;
@@ -1398,25 +1478,15 @@ function processEmphasis(nodes, delims, startIdx, endIdx) {
         break;
       }
       if (!opener) break;
-      // Odd-match rule (+ ghost rule): if the sum of the lengths is a
-      // multiple of 3 and EITHER delimiter can both open and close, the
-      // pair must not match (unless both lengths are multiples of 3).
+      // Odd-match rule (+ consumed-pair rule): if the sum of the
+      // lengths is a multiple of 3 and EITHER delimiter can both open
+      // and close, the pair must not match (unless both lengths are
+      // multiples of 3).
       let blocked = false;
       const sum = opener.len + closer.len;
       const bothMult3 = opener.len % 3 === 0 && closer.len % 3 === 0;
       if ((closer.canOpen || opener.canClose) && sum % 3 === 0 && !bothMult3) blocked = true;
-      if (!blocked && !closer.canOpen) {
-        // Ghost rule: a consumed delimiter between opener and closer,
-        // with closer.len <= ghost.origLen, enables the rule-of-3.
-        for (const g of ghosts) {
-          if (g.ch !== closer.ch) continue;
-          const gIdx = nodes.indexOf(g.node);
-          if (gIdx > oIdx && gIdx < cIdx && closer.len <= g.origLen) {
-            if (sum % 3 === 0 && !bothMult3) { blocked = true; }
-            break;
-          }
-        }
-      }
+      if (!blocked && pairBlocks(opener, closer, oIdx, cIdx, sum)) blocked = true;
       if (blocked) {
         // This opener can't match this closer; try an earlier opener.
         // Mark it temporarily skipped by looking further back: we do this
@@ -1429,7 +1499,7 @@ function processEmphasis(nodes, delims, startIdx, endIdx) {
         let found = null;
         for (let k = delims.length - 1; k >= 0; k--) {
           const d = delims[k];
-          if (d === closer || d.ch !== closer.ch || !d.canOpen || d.len <= 0) continue;
+          if (d === closer || d.ch !== closer.ch || !d.canOpen || d.len <= 0 || d.suppressed) continue;
           if (d.ch === '~' && d.len !== closer.len) continue;
           if (closer._skip.has(d)) continue;
           const di = nodes.indexOf(d.node);
@@ -1447,25 +1517,13 @@ function processEmphasis(nodes, delims, startIdx, endIdx) {
           closer._skip.add(opener);
           continue;
         }
-        if (!closer.canOpen) {
-          let gb = false;
-          for (const g of ghosts) {
-            if (g.ch !== closer.ch) continue;
-            const gIdx = nodes.indexOf(g.node);
-            if (gIdx > oIdx && gIdx < cIdx && closer.len <= g.origLen) {
-              if (sum2 % 3 === 0 && !both2) gb = true;
-              break;
-            }
-          }
-          if (gb) { closer._skip.add(opener); continue; }
-        }
+        if (pairBlocks(opener, closer, oIdx, cIdx, sum2)) { closer._skip.add(opener); continue; }
       }
       // Match: use 2 if both have >= 2, else 1. '~' always makes <del>.
       const use = (opener.len >= 2 && closer.len >= 2) ? 2 : 1;
       const kind = opener.ch === '~' ? 'del' : (use === 2 ? 'strong' : 'em');
-      // Record ghosts for the consumed delimiters.
-      ghosts.push({ node: opener.node, origLen: opener.len, ch: opener.ch });
-      ghosts.push({ node: closer.node, origLen: closer.len, ch: closer.ch });
+      // Record the consumed pair (original closer length + flanking).
+      consumed.push({ oNode: opener.node, cNode: closer.node, oCanClose: opener.canClose, cCanOpen: closer.canOpen, cOrigLen: closer.len, ch: closer.ch });
       opener.len -= use;
       closer.len -= use;
       // Sync the node lengths: the renderer prints node.len chars.
@@ -1518,6 +1576,7 @@ function matchImage(s, i, refs) {
   }
   if (close === -1) return null;
   const label = s.slice(i + 2, close);
+  if (!labelBackticksValid(label)) return null; // H3: fall back to brackets
   const next = close + 1;
   // Inline tail: (dest "title")
   if (s[next] === '(') {
@@ -1622,6 +1681,21 @@ function parseInline(src, refs, st) {
           k = e;
         } else k++;
       }
+      if (found !== -1 && brackets.length > 0) {
+        // A code span must not swallow a ']' that closes an H3-valid
+        // link label (marked matches the link first). A span may still
+        // contain '](u)' when the label it would close is H3-invalid.
+        for (let q = j; q < found; q++) {
+          if (s[q] !== ']') continue;
+          let br = null;
+          for (let b = brackets.length - 1; b >= 0; b--) {
+            if (brackets[b].active && brackets[b].srcStart < i) { br = brackets[b]; break; }
+          }
+          if (!br) break;
+          const lab = s.slice(br.srcStart + 1, q);
+          if (labelBackticksValid(lab) && linkTailAfter(s, q + 1, lab, refs)) { found = -1; break; }
+        }
+      }
       if (found !== -1) {
         let content = s.slice(j, found).replace(/\n/g, ' ');
         if (content.length >= 2 && content[0] === ' ' && content[content.length - 1] === ' ' && content.trim().length > 0) {
@@ -1692,11 +1766,14 @@ function parseInline(src, refs, st) {
       if (bi === -1) { buf += c; i++; continue; }
       const br = brackets[bi];
       const bNodeIdx = nodes.indexOf(br.node);
+      const labelText = s.slice(br.srcStart + 1, i);
+      const h3Valid = labelBackticksValid(labelText);
       // Parse the tail.
       let dest = null;
       let title = null;
       let next = i + 1;
       let formed = false;
+      let inlineTail = false; // a syntactically valid inline (dest) tail
       if (s[next] === '(') {
         // Inline link: (dest "title")
         let p = next + 1;
@@ -1717,7 +1794,7 @@ function parseInline(src, refs, st) {
             if (tRes) { title = tRes[0]; t = tRes[1]; }
           }
           while (t < n && (s[t] === ' ' || s[t] === '\t' || s[t] === '\n')) t++;
-          if (t < n && s[t] === ')') { formed = true; next = t + 1; }
+          if (t < n && s[t] === ')') { formed = true; next = t + 1; inlineTail = true; }
         }
         if (!formed) {
           // A failed inline link falls back to a shortcut reference.
@@ -1741,6 +1818,16 @@ function parseInline(src, refs, st) {
         const label = s.slice(br.srcStart + 1, i);
         const ref = refs[normalizeLabel(label)];
         if (ref) { dest = ref.dest; title = ref.title; formed = true; next = i + 1; }
+      }
+      if (formed && !h3Valid) formed = false; // H3-invalid label: no link
+      if (!formed && inlineTail && !h3Valid) {
+        // H3-invalid label with a valid inline tail: emphasis inside
+        // the label is suppressed (oracle-probed; ref/no tails don't
+        // suppress). Mark the label's delimiters; processEmphasis
+        // skips suppressed entries.
+        for (const d of delims) {
+          if (nodes.indexOf(d.node) > bNodeIdx) d.suppressed = true;
+        }
       }
       if (formed) {
         flush(); // the link text may still be buffered; it belongs in the nodes
