@@ -760,10 +760,15 @@ function parseBlocks(src) {
   for (let ln = 0; ln < lines.length; ln++) {
     let line = lines[ln];
     // Snapshot the stack + item child counts (for blank-line looseness
-    // bookkeeping at end of line).
-    const stackBefore = new Set(stack);
-    const childCounts = new Map();
-    for (const b of stack) if (b.t === 'item') childCounts.set(b, b.children.length);
+    // bookkeeping at end of line) — but only when it can matter: the
+    // bookkeeping only acts on items with _pendingBlank, and that flag
+    // is only ever set on blank lines, so on a non-blank line with no
+    // pending blank the Set/Map allocation is pure overhead (the
+    // common case on long documents).
+    const needSnapshot = isBlank(line) || stack.some(b => b.t === 'item' && b._pendingBlank);
+    const stackBefore = needSnapshot ? new Set(stack) : null;
+    const childCounts = needSnapshot ? new Map() : null;
+    if (needSnapshot) for (const b of stack) if (b.t === 'item') childCounts.set(b, b.children.length);
     // ---- Phase 1: match open containers (outer to inner) ----
     let rest = line;
     let failAt = -1;
@@ -1115,14 +1120,16 @@ function parseBlocks(src) {
       break;
     }
     // Blank-line looseness bookkeeping for every open item with a
-    // pending blank:
+    // pending blank (skipped when no snapshot was taken: no item had
+    // a pending blank and this line is not blank, so the loop would
+    // find nothing to do):
     // - it gained a direct child this line (and had one before): the
     //   blank was between two of its blocks -> blankBetween;
     // - a new node appeared deeper than it (inside its subtree): the
     //   blank was nested inside, not between its own blocks -> clear;
     // - otherwise the blank is still pending (it becomes blankAfter
     //   if the item closes without further content).
-    for (let si = 0; si < stack.length; si++) {
+    if (needSnapshot) for (let si = 0; si < stack.length; si++) {
       const b = stack[si];
       if (b.t !== 'item' || !b._pendingBlank) continue;
       const before = childCounts.get(b);
