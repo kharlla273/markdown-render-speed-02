@@ -1243,7 +1243,16 @@ function matchAutolink(s, i) {
   return null;
 }
 
-const EMAIL_LOCAL = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+$/;
+// Email local-part chars (ASCII only), as a lookup table indexed by
+// char code — far cheaper than testing a regex per character in the hot
+// scanEmail loop. Same set as the old /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+$/.
+const EMAIL_LOCAL_TABLE = new Uint8Array(128);
+for (const ch of "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.!#$%&'*+/=?^_`{|}~-") EMAIL_LOCAL_TABLE[ch.charCodeAt(0)] = 1;
+function isEmailLocalChar(c) {
+  if (c === undefined) return false;
+  const code = c.charCodeAt(0);
+  return code < 128 && EMAIL_LOCAL_TABLE[code] === 1;
+}
 const DOMAIN_LABEL = /^[A-Za-z0-9-]+$/;
 // Scan a domain starting at s[i] (labels separated by dots). Returns the
 // end index (exclusive) or -1 if invalid. Requires at least one dot and a
@@ -1280,7 +1289,7 @@ function scanDomain(s, i, requireDot, allowUnderscoreStart) {
 // rejecting the email — but only if the run can close.
 function scanEmail(s, i, trimUnderscore) {
   let j = i;
-  while (j < s.length && EMAIL_LOCAL.test(s[j])) j++;
+  while (j < s.length && isEmailLocalChar(s[j])) j++;
   if (j >= s.length || s[j] !== '@') return -1;
   const local = s.slice(i, j);
   if (local.length === 0 || local.startsWith('.') || local.endsWith('.') || local.indexOf('..') !== -1) return -1;
@@ -1407,57 +1416,67 @@ function scanAutolinkPath(s, i, hasActiveBracket, stripStart) {
 // (preceded by start/whitespace/punct, not '.'), then a bare email
 // (alnum at a word start). Returns {dest, text, len} or null.
 function matchExtendedAutolink(s, i, hasActiveBracket, trimEmailUnderscore) {
-  // :// schemes.
-  const low = s.slice(i, i + 8).toLowerCase();
-  let urlSchemeLen = 0;
-  if (low.startsWith('https://')) urlSchemeLen = 8;
-  else if (low.startsWith('http://')) urlSchemeLen = 7;
-  else if (low.startsWith('ftp://')) urlSchemeLen = 6;
-  if (urlSchemeLen > 0) {
-    const after = i + urlSchemeLen;
-    const hostEnd = scanDomain(s, after, false, false);
-    if (hostEnd !== -1) {
-      const pathEnd = scanAutolinkPath(s, hostEnd, hasActiveBracket, after);
-      const text = s.slice(i, pathEnd);
-      return { dest: text, text, len: pathEnd - i };
-    }
-    return null;
-  }
-  // mailto: (no path) / xmpp: (at most one path segment).
-  if (s.startsWith('mailto:', i) || s.startsWith('xmpp:', i)) {
-    const isXmpp = s[i] === 'x';
-    const after = i + (isXmpp ? 5 : 7);
-    const emEnd = scanEmail(s, after, trimEmailUnderscore);
-    if (emEnd !== -1) {
-      let end = emEnd;
-      if (isXmpp && s[end] === '/') {
-        const segEnd = scanXmppSegment(s, end + 1);
-        if (segEnd > end + 1) end = segEnd;
+  // First-character dispatch: each scheme can only start with its own
+  // first letter, so skip the slice+toLowerCase for the vast majority of
+  // positions. Behaviour is identical to the old sequential checks.
+  const c0 = s[i];
+  // :// schemes (case-insensitive) — only h/f starts can match.
+  if (c0 === 'h' || c0 === 'H' || c0 === 'f' || c0 === 'F') {
+    const low = s.slice(i, i + 8).toLowerCase();
+    let urlSchemeLen = 0;
+    if (low.startsWith('https://')) urlSchemeLen = 8;
+    else if (low.startsWith('http://')) urlSchemeLen = 7;
+    else if (low.startsWith('ftp://')) urlSchemeLen = 6;
+    if (urlSchemeLen > 0) {
+      const after = i + urlSchemeLen;
+      const hostEnd = scanDomain(s, after, false, false);
+      if (hostEnd !== -1) {
+        const pathEnd = scanAutolinkPath(s, hostEnd, hasActiveBracket, after);
+        const text = s.slice(i, pathEnd);
+        return { dest: text, text, len: pathEnd - i };
       }
-      const text = s.slice(i, end);
-      return { dest: text, text, len: end - i };
+      return null;
     }
-    return null;
+  }
+  // mailto: (no path) / xmpp: (at most one path segment) — lowercase-only.
+  else if (c0 === 'm' || c0 === 'x') {
+    if (s.startsWith('mailto:', i) || s.startsWith('xmpp:', i)) {
+      const isXmpp = c0 === 'x';
+      const after = i + (isXmpp ? 5 : 7);
+      const emEnd = scanEmail(s, after, trimEmailUnderscore);
+      if (emEnd !== -1) {
+        let end = emEnd;
+        if (isXmpp && s[end] === '/') {
+          const segEnd = scanXmppSegment(s, end + 1);
+          if (segEnd > end + 1) end = segEnd;
+        }
+        const text = s.slice(i, end);
+        return { dest: text, text, len: end - i };
+      }
+      return null;
+    }
   }
   // www. — must be preceded by start/whitespace/punct (not alnum or '.').
-  if (s.startsWith('www.', i)) {
-    const prev = i === 0 ? undefined : s[i - 1];
-    if (prev === undefined || isUniSpace(prev) || (isUniPunct(prev) && prev !== '.')) {
-      const domEnd = scanDomain(s, i + 4, false, false);
-      if (domEnd !== -1) {
-        const pathEnd = scanAutolinkPath(s, domEnd, hasActiveBracket, i + 4);
-        const text = s.slice(i, pathEnd);
-        return { dest: 'http://' + text, text, len: pathEnd - i };
+  else if (c0 === 'w') {
+    if (s.startsWith('www.', i)) {
+      const prev = i === 0 ? undefined : s[i - 1];
+      if (prev === undefined || isUniSpace(prev) || (isUniPunct(prev) && prev !== '.')) {
+        const domEnd = scanDomain(s, i + 4, false, false);
+        if (domEnd !== -1) {
+          const pathEnd = scanAutolinkPath(s, domEnd, hasActiveBracket, i + 4);
+          const text = s.slice(i, pathEnd);
+          return { dest: 'http://' + text, text, len: pathEnd - i };
+        }
       }
+      return null;
     }
-    return null;
   }
   // Email: local@domain. Trigger on alnum at a word start.
-  const c = s[i];
+  const c = c0;
   const isAlnum = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
   if (!isAlnum) return null;
   const prev = i === 0 ? undefined : s[i - 1];
-  if (prev !== undefined && EMAIL_LOCAL.test(prev)) return null;
+  if (prev !== undefined && isEmailLocalChar(prev)) return null;
   const emEnd = scanEmail(s, i, trimEmailUnderscore);
   if (emEnd === -1) return null;
   const text = s.slice(i, emEnd);
@@ -2064,15 +2083,33 @@ function parseInline(src, refs, st) {
       }
       continue;
     }
-    // Extended autolinks (suppressed inside an unclosed <a>).
-    if (!st.inAnchor && (c === 'w' || ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')))) {
-      const hasActiveBracket = brackets.some(b => b.active);
-      const ea = matchExtendedAutolink(s, i, hasActiveBracket, uOpen > uClose);
-      if (ea) {
-        flush();
-        nodes.push({ t: 'link', dest: ea.dest, title: null, children: textNodesWithEntities(ea.text), ext: true });
-        i += ea.len;
-        continue;
+    // Extended autolinks (suppressed inside an unclosed <a>). Only
+    // attempt at positions that can match: :// schemes and mailto:/
+    // xmpp: have no preceding-char restriction, so h/H/f/F/m/x are
+    // tried anywhere; www. and email both fail when the previous char
+    // is alphanumeric or '.' (www. needs a start/space/punct prev,
+    // email needs a non-local prev), so mid-word positions skip the
+    // attempt entirely — the old code tried at every alnum char.
+    if (!st.inAnchor) {
+      let tryAutolink = false;
+      if (c === 'h' || c === 'H' || c === 'f' || c === 'F' || c === 'm' || c === 'x') {
+        tryAutolink = true;
+      } else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+        if (i === 0) tryAutolink = true;
+        else {
+          const pv = s[i - 1];
+          tryAutolink = !((pv >= 'a' && pv <= 'z') || (pv >= 'A' && pv <= 'Z') || (pv >= '0' && pv <= '9') || pv === '.');
+        }
+      }
+      if (tryAutolink) {
+        const hasActiveBracket = brackets.some(b => b.active);
+        const ea = matchExtendedAutolink(s, i, hasActiveBracket, uOpen > uClose);
+        if (ea) {
+          flush();
+          nodes.push({ t: 'link', dest: ea.dest, title: null, children: textNodesWithEntities(ea.text), ext: true });
+          i += ea.len;
+          continue;
+        }
       }
     }
     buf += c;
