@@ -761,6 +761,7 @@ function parseBlocks(src) {
       // (types 1-6 can interrupt a paragraph; type 7 cannot).
       if (leaf && leaf.t === 'para' && !isBlank(rest) && !matchList(rest) &&
           !matchFenceStart(rest) && !matchATX(rest) && !matchHr(rest) &&
+          !matchQuote(rest) &&
           !matchHtmlStart(rest, true)) {
         // A lazy line loses up to 4 columns of leading indent when it
         // has 4+ (the indented-code offset is consumed during matching).
@@ -903,8 +904,10 @@ function parseBlocks(src) {
         }
         break;
       }
-      // Setext underline (paragraph open)
-      if (paraOpen) {
+      // Setext underline (paragraph open) — but a table paragraph is
+      // never a setext heading: its second line is the delimiter row
+      // and later lines are table rows.
+      if (paraOpen && !isTablePara(topLeaf())) {
         const se = matchSetext(rest);
         if (se) {
           const para = topLeaf();
