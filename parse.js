@@ -1431,12 +1431,53 @@ function processEmphasis(nodes, delims, startIdx, endIdx) {
     return idx >= startIdx && idx < endIdx;
   };
   // Consumed pairs from matches made in this pass: {oNode, cNode,
-  // oCanClose, cCanOpen, cOrigLen, ch}. A consumed pair blocks a later
+  // oCanClose, cCanOpen, cOrigLen, ch, use}. A consumed pair blocks a later
   // single-use match spanning it when its opener cannot close, its
   // closer can open, and (its closer's original length is >= 2, or the
   // prospective sum is a multiple of 3 with the closer no longer than
   // the consumed closer's original length).
   const consumed = [];
+  // Leftover-inside / exact-block rule (oracle-probed, '*' only): when a
+  // consumed same-char EM pair (use 1) sits strictly between a strong
+  // opener and closer, and the consumed closer can open, then a closer
+  // run with leftovers renders them INSIDE the strong. The exact-block
+  // half additionally requires the consumed opener to be unable to
+  // close (cm-429 `**foo*bar*baz**` forms strong; M17 `**a *b*c**`
+  // does not): a closer run exactly consumed by the strong (len == 2)
+  // does not match at all.
+  const insideRuleApplies = (opener, closer, oIdx, cIdx) => {
+    if (closer.ch !== '*') return false;
+    for (const p of consumed) {
+      if (p.ch !== '*' || p.use !== 1) continue;
+      if (!p.cCanOpen) continue;
+      const oi = nodes.indexOf(p.oNode);
+      const ci = nodes.indexOf(p.cNode);
+      if (oi > oIdx && oi < cIdx && ci > oIdx && ci < cIdx) return true;
+    }
+    return false;
+  };
+  const exactBlockApplies = (opener, closer, oIdx, cIdx) => {
+    if (closer.ch !== '*') return false;
+    for (const p of consumed) {
+      if (p.ch !== '*' || p.use !== 1) continue;
+      if (p.oCanClose || !p.cCanOpen) continue;
+      const oi = nodes.indexOf(p.oNode);
+      const ci = nodes.indexOf(p.cNode);
+      if (!(oi > oIdx && oi < cIdx && ci > oIdx && ci < cIdx)) continue;
+      // Lifted if a live closer-only '*' delimiter sits between the
+      // pair's closer and the prospective closer (oracle-probed:
+      // doc-01/26 `*so*other* option` forms strong; a canOpen
+      // delimiter between does not lift it).
+      let lifted = false;
+      for (const d of delims) {
+        if (d.ch !== '*' || d.canOpen || d.len <= 0) continue;
+        const di = nodes.indexOf(d.node);
+        if (di > ci && di < cIdx) { lifted = true; break; }
+      }
+      if (!lifted) return true;
+    }
+    return false;
+  };
   const pairBlocks = (opener, closer, oIdx, cIdx, sum) => {
     const use = (opener.len >= 2 && closer.len >= 2) ? 2 : 1;
     if (use !== 1) return false;
@@ -1487,6 +1528,10 @@ function processEmphasis(nodes, delims, startIdx, endIdx) {
       const bothMult3 = opener.len % 3 === 0 && closer.len % 3 === 0;
       if ((closer.canOpen || opener.canClose) && sum % 3 === 0 && !bothMult3) blocked = true;
       if (!blocked && pairBlocks(opener, closer, oIdx, cIdx, sum)) blocked = true;
+      if (!blocked) {
+        const use0 = (opener.len >= 2 && closer.len >= 2) ? 2 : 1;
+        if (use0 === 2 && closer.ch === '*' && closer.len === 2 && exactBlockApplies(opener, closer, oIdx, cIdx)) blocked = true;
+      }
       if (blocked) {
         // This opener can't match this closer; try an earlier opener.
         // Mark it temporarily skipped by looking further back: we do this
@@ -1518,12 +1563,16 @@ function processEmphasis(nodes, delims, startIdx, endIdx) {
           continue;
         }
         if (pairBlocks(opener, closer, oIdx, cIdx, sum2)) { closer._skip.add(opener); continue; }
+        {
+          const use2 = (opener.len >= 2 && closer.len >= 2) ? 2 : 1;
+          if (use2 === 2 && closer.ch === '*' && closer.len === 2 && exactBlockApplies(opener, closer, oIdx, cIdx)) { closer._skip.add(opener); continue; }
+        }
       }
       // Match: use 2 if both have >= 2, else 1. '~' always makes <del>.
       const use = (opener.len >= 2 && closer.len >= 2) ? 2 : 1;
       const kind = opener.ch === '~' ? 'del' : (use === 2 ? 'strong' : 'em');
       // Record the consumed pair (original closer length + flanking).
-      consumed.push({ oNode: opener.node, cNode: closer.node, oCanClose: opener.canClose, cCanOpen: closer.canOpen, cOrigLen: closer.len, ch: closer.ch });
+      consumed.push({ oNode: opener.node, cNode: closer.node, oCanClose: opener.canClose, cCanOpen: closer.canOpen, cOrigLen: closer.len, ch: closer.ch, use });
       opener.len -= use;
       closer.len -= use;
       // Sync the node lengths: the renderer prints node.len chars.
@@ -1532,6 +1581,14 @@ function processEmphasis(nodes, delims, startIdx, endIdx) {
       // Wrap nodes between opener and closer.
       const children = nodes.slice(oIdx + 1, cIdx);
       const emNode = { t: kind, children };
+      // Leftover-inside rule: a strong closer's leftover delimiters
+      // render INSIDE the strong when the inside rule applies; the
+      // leftover then takes no further part in matching.
+      if (kind === 'strong' && closer.ch === '*' && closer.len > 0 && insideRuleApplies(opener, closer, oIdx, cIdx)) {
+        emNode.children.push({ t: 'text', s: closer.ch.repeat(closer.len) });
+        closer.len = 0;
+        closer.node.len = 0;
+      }
       nodes.splice(oIdx + 1, cIdx - oIdx - 1, emNode);
       // Continue: the closer may match another opener.
     }
