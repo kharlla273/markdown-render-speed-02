@@ -749,7 +749,11 @@ function parseBlocks(src) {
       // the item; and when the line is itself a fence line, it cannot
       // close this fence from outside the item — the fence closes
       // implicitly and the line opens a new fence at the outer level.
-      if (quoteFailInsideItem !== -1) closeTo(quoteFailInsideItem);
+      // A quote failing inside a failed item also ends the item: the
+      // line is outside the item (its indent failed), so closing only
+      // to the quote would leave a dead item open and nest the line's
+      // blocks inside it instead of placing them as siblings.
+      if (quoteFailInsideItem !== -1) closeTo(failAt);
       else if (leaf.lines.length === 0 || matchFenceStart(rest)) closeTo(failAt);
     } else if (failAt !== -1) {
       // Lazy continuation? Only for an open paragraph + a line that is
