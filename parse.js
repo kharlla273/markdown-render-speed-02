@@ -5,7 +5,13 @@
 // ---------- small helpers ----------
 const ESC_TEXT = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 const ESC_ATTR = { '&': '&amp;', '"': '&quot;', '<': '&lt;', '>': '&gt;' };
-function escText(s) { return s.replace(/[&<>"']/g, c => ESC_TEXT[c]); }
+const RE_ESC_TEST = /[&<>"']/; // non-global: safe to reuse with .test
+function escText(s) {
+  // Fast path: most text has no escapable chars — one test pass, no
+  // replace machinery and no per-match callback.
+  if (!RE_ESC_TEST.test(s)) return s;
+  return s.replace(/[&<>"']/g, c => ESC_TEXT[c]);
+}
 // Entity-aware attribute escape: escape & " < >, but preserve a & that
 // starts a valid entity reference (&name; or valid &#...;).
 function escAttr(s) {
