@@ -818,11 +818,17 @@ function parseBlocks(src) {
     // end-of-line bookkeeping clears it on items whose subtree
     // continued (the blank was nested inside them, not between their
     // own blocks). Blank lines inside code blocks (or type 1-5 HTML
-    // blocks) are content, not structural blanks.
+    // blocks) are content, not structural blanks — UNLESS a container
+    // failed to match on this line (failAt): then the code/HTML block
+    // closes with it (closeTo below) and the blank is structural for
+    // the enclosing items (oracle: an empty fence inside a quote, then
+    // a marker-less blank, then a fence at the outer item's indent
+    // makes the outer list loose — the blank counts, the fence stays
+    // empty).
     if (blankItems.length > 0) {
       const leafIsCode = leaf && leaf.t === 'code';
       const leafIsHtml15 = leaf && leaf.t === 'html' && leaf.htmlType >= 1 && leaf.htmlType <= 5;
-      if (!leafIsCode && !leafIsHtml15) {
+      if ((!leafIsCode && !leafIsHtml15) || failAt !== -1) {
         for (const it of blankItems) it._pendingBlank = true;
       }
     }
