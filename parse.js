@@ -736,11 +736,14 @@ function parseBlocks(src) {
       // + indent strip) with the rest as matched up to the failure.
       if (quoteFailInsideItem !== -1) closeTo(quoteFailInsideItem);
     } else if (failAt !== -1) {
-      // Lazy continuation? Only for an open paragraph + non-blank line,
+      // Lazy continuation? Only for an open paragraph + a line that is
+      // non-blank AS SEEN INSIDE the matched containers (a '>' line
+      // whose rest is blank after the outer marker ends the inner
+      // paragraph — it must not lazy-continue it with an empty line),
       // and NOT a line that starts a new block: a list item, a fenced
       // code block, an ATX heading, a thematic break, or an HTML block
       // (types 1-6 can interrupt a paragraph; type 7 cannot).
-      if (leaf && leaf.t === 'para' && !isBlank(line) && !matchList(rest) &&
+      if (leaf && leaf.t === 'para' && !isBlank(rest) && !matchList(rest) &&
           !matchFenceStart(rest) && !matchATX(rest) && !matchHr(rest) &&
           !matchHtmlStart(rest, true)) {
         // A lazy line loses up to 4 columns of leading indent when it
