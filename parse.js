@@ -29,7 +29,9 @@ function isSpaceOrTab(c) { return c === ' ' || c === '\t'; }
 const PUNCT = new Set('!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~'.split(''));
 function isPunct(c) { return c !== undefined && PUNCT.has(c); }
 // Unicode punctuation / whitespace tests (for flanking rules).
-const RE_PUNCT = /\p{P}/u;
+// Punctuation includes Unicode Sc (currency symbols like $/£/€) — marked
+// treats them as punctuation for flanking.
+const RE_PUNCT = /[\p{P}\p{Sc}]/u;
 const RE_SPACE = /\s/u;
 function isUniPunct(c) { return c !== undefined && RE_PUNCT.test(c); }
 function isUniSpace(c) { return c === undefined || RE_SPACE.test(c); }
@@ -1049,34 +1051,71 @@ const DOMAIN_LABEL = /^[A-Za-z0-9-]+$/;
 // Scan a domain starting at s[i] (labels separated by dots). Returns the
 // end index (exclusive) or -1 if invalid. Requires at least one dot and a
 // final label of 2+ letters. Stops at ']', ')', '(' (guidance).
-function scanDomain(s, i) {
+// Scan a domain starting at s[i]. Labels are [A-Za-z0-9_-]+ (a label may
+// start with '-'; it may start with '_' only when allowUnderscoreStart,
+// i.e. email domains — www/scheme hosts reject a leading '_'). A '.' is
+// a separator only when followed by a label char, so a trailing '.'
+// ends the domain. requireDot: at least one '.' must be consumed (email
+// only — www and :// hosts need no dot). No TLD rule. Returns the end
+// index (exclusive), or -1 if invalid.
+function scanDomain(s, i, requireDot, allowUnderscoreStart) {
+  const first = s[i];
+  if (first === undefined) return -1;
+  const isLabelCh = c => (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c === '-' || c === '_';
+  if (!isLabelCh(first) || (first === '_' && !allowUnderscoreStart)) return -1;
   let j = i;
-  let labels = 0;
-  let lastLabelStart = i;
+  let dots = 0;
   while (j < s.length) {
     const c = s[j];
-    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c === '-') { j++; continue; }
-    if (c === '.') {
-      const label = s.slice(lastLabelStart, j);
-      if (!DOMAIN_LABEL.test(label)) return -1;
-      labels++;
-      j++;
-      lastLabelStart = j;
-      continue;
-    }
+    if (isLabelCh(c)) { j++; continue; }
+    if (c === '.' && j + 1 < s.length && isLabelCh(s[j + 1])) { dots++; j++; continue; }
     break;
   }
-  const lastLabel = s.slice(lastLabelStart, j);
-  if (labels < 1) return -1;
-  if (!/^[A-Za-z]{2,}$/.test(lastLabel)) return -1;
+  if (j === i) return -1;
+  if (requireDot && dots < 1) return -1;
+  return j;
+}
+// Scan an email address starting at s[i] (local-part start). Returns the
+// end index (exclusive) or -1. The domain needs a dot and must not end
+// with '-' or '_'.
+function scanEmail(s, i) {
+  let j = i;
+  while (j < s.length && EMAIL_LOCAL.test(s[j])) j++;
+  if (j >= s.length || s[j] !== '@') return -1;
+  const local = s.slice(i, j);
+  if (local.length === 0 || local.startsWith('.') || local.endsWith('.') || local.indexOf('..') !== -1) return -1;
+  const domEnd = scanDomain(s, j + 1, true, true);
+  if (domEnd === -1) return -1;
+  const last = s[domEnd - 1];
+  if (last === '-' || last === '_') return -1;
+  return domEnd;
+}
+// Scan an xmpp path segment starting at s[i] (after the '/'). Segment
+// chars are [A-Za-z0-9@]; '.' is included only when followed by a segment
+// char. Returns the end index (== i if empty).
+function scanXmppSegment(s, i) {
+  let j = i;
+  const isSeg = c => (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c === '@';
+  while (j < s.length) {
+    const c = s[j];
+    if (isSeg(c)) { j++; continue; }
+    if (c === '.' && j + 1 < s.length && isSeg(s[j + 1])) { j++; continue; }
+    break;
+  }
   return j;
 }
 // Scan an extended-autolink path starting at s[i] (after the domain).
-// Handles parens (an opening paren is included only if a closing paren
-// follows before whitespace; balance counts only after the last ']'),
-// stops at whitespace/'<', and strips trailing punctuation.
-// Returns the end index (exclusive).
-function scanAutolinkPath(s, i, hasActiveBracket) {
+// Stops at whitespace/'<'; a ']' ends the path if hasActiveBracket,
+// otherwise it is included and the paren rules apply only after the last
+// ']'. stripStart is the lower bound for the trailing-punctuation strip
+// (the domain start — a trailing '_' on the domain itself is stripped).
+// Paren rules (oracle-verified): (a) cut at the first '(' with no ')'
+// anywhere after it in the segment; (b) after the last '(' at most one
+// ')' may remain — drop excess TRAILING ')'s (none if no '(' at all);
+// a ')' in the middle of the path is always kept. A trailing
+// entity-like &name; (alphanumeric body) is excluded whole; a ';' that
+// is not part of one is stripped alone. Returns the end index.
+function scanAutolinkPath(s, i, hasActiveBracket, stripStart) {
   let j = i;
   let lastBracket = -1;
   while (j < s.length) {
@@ -1091,41 +1130,44 @@ function scanAutolinkPath(s, i, hasActiveBracket) {
     j++;
   }
   let end = j;
-  // Paren balance, counted only after the last ']'.
+  // Paren rules, applied to the segment after the last ']'.
   const segStart = lastBracket === -1 ? i : lastBracket + 1;
-  let depth = 0;
-  for (let k = segStart; k < end; k++) {
-    if (s[k] === '(') depth++;
-    else if (s[k] === ')') {
-      if (depth === 0) { end = k; break; }
-      depth--;
+  // (a) Cut at the first '(' with no ')' after it in the segment.
+  let lastClose = -1;
+  for (let k = end - 1; k >= segStart; k--) {
+    if (s[k] === ')') { lastClose = k; break; }
+  }
+  if (lastClose === -1) {
+    for (let k = segStart; k < end; k++) {
+      if (s[k] === '(') { end = k; break; }
+    }
+  } else {
+    for (let k = lastClose; k < end; k++) {
+      if (s[k] === '(') { end = k; break; }
     }
   }
-  // An unmatched '(' is dropped (and everything after it).
-  if (depth > 0) {
-    let d = 0;
-    for (let k = segStart; k < end; k++) {
-      if (s[k] === '(') d++;
-      else if (s[k] === ')') d--;
-      if (d > 0 && k === end - 1) { /* keep scanning */ }
-    }
-    // Find the first unmatched '(' from the left within the segment.
-    let bal = 0;
-    let cut = -1;
-    for (let k = segStart; k < end; k++) {
-      if (s[k] === '(') { bal++; if (cut === -1) cut = k; }
-      else if (s[k] === ')') { bal--; if (bal === 0) cut = -1; }
-    }
-    if (bal > 0 && cut !== -1) end = cut;
+  // (b) Trailing ')': after the last '(' at most one ')' may remain.
+  let lastOpen = -1;
+  for (let k = end - 1; k >= segStart; k--) {
+    if (s[k] === '(') { lastOpen = k; break; }
   }
-  // Strip trailing punctuation: ? ! . , : * _ ~
-  while (end > i) {
+  let closesAfter = 0;
+  for (let k = (lastOpen === -1 ? segStart : lastOpen + 1); k < end; k++) {
+    if (s[k] === ')') closesAfter++;
+  }
+  let excess = closesAfter - (lastOpen === -1 ? 0 : 1);
+  while (excess > 0 && end > segStart && s[end - 1] === ')') { end--; excess--; }
+  // (c) Strip trailing punctuation: ? ! . , : * _ ~ ; — a trailing
+  // entity-like &name; is excluded whole.
+  while (end > stripStart) {
     const c = s[end - 1];
     if (c === '?' || c === '!' || c === '.' || c === ',' || c === ':' || c === '*' || c === '_' || c === '~') { end--; continue; }
     if (c === ';') {
-      // Keep the ';' if it completes an entity (e.g. &amp;).
       const amp = s.lastIndexOf('&', end - 1);
-      if (amp !== -1 && amp >= i && /^[A-Za-z0-9#]+$/.test(s.slice(amp + 1, end - 1))) break;
+      if (amp !== -1 && amp >= stripStart && /^[A-Za-z0-9]+$/.test(s.slice(amp + 1, end - 1))) {
+        end = amp;
+        continue;
+      }
       end--;
       continue;
     }
@@ -1134,16 +1176,51 @@ function scanAutolinkPath(s, i, hasActiveBracket) {
   return end;
 }
 
-// Try to match an extended autolink (www. or email) at s[i].
-// Returns {dest, text, len} or null. hasActiveBracket: a '[' is open.
+// Try to match an extended autolink at s[i]. Schemes first (no
+// preceding-char restriction): http://, https://, ftp:// are
+// case-insensitive; mailto: and xmpp: are lowercase-only. Then www.
+// (preceded by start/whitespace/punct, not '.'), then a bare email
+// (alnum at a word start). Returns {dest, text, len} or null.
 function matchExtendedAutolink(s, i, hasActiveBracket) {
+  // :// schemes.
+  const low = s.slice(i, i + 8).toLowerCase();
+  let urlSchemeLen = 0;
+  if (low.startsWith('https://')) urlSchemeLen = 8;
+  else if (low.startsWith('http://')) urlSchemeLen = 7;
+  else if (low.startsWith('ftp://')) urlSchemeLen = 6;
+  if (urlSchemeLen > 0) {
+    const after = i + urlSchemeLen;
+    const hostEnd = scanDomain(s, after, false, false);
+    if (hostEnd !== -1) {
+      const pathEnd = scanAutolinkPath(s, hostEnd, hasActiveBracket, after);
+      const text = s.slice(i, pathEnd);
+      return { dest: text, text, len: pathEnd - i };
+    }
+    return null;
+  }
+  // mailto: (no path) / xmpp: (at most one path segment).
+  if (s.startsWith('mailto:', i) || s.startsWith('xmpp:', i)) {
+    const isXmpp = s[i] === 'x';
+    const after = i + (isXmpp ? 5 : 7);
+    const emEnd = scanEmail(s, after);
+    if (emEnd !== -1) {
+      let end = emEnd;
+      if (isXmpp && s[end] === '/') {
+        const segEnd = scanXmppSegment(s, end + 1);
+        if (segEnd > end + 1) end = segEnd;
+      }
+      const text = s.slice(i, end);
+      return { dest: text, text, len: end - i };
+    }
+    return null;
+  }
   // www. — must be preceded by start/whitespace/punct (not alnum or '.').
   if (s.startsWith('www.', i)) {
     const prev = i === 0 ? undefined : s[i - 1];
     if (prev === undefined || isUniSpace(prev) || (isUniPunct(prev) && prev !== '.')) {
-      const domEnd = scanDomain(s, i + 4);
+      const domEnd = scanDomain(s, i + 4, false, false);
       if (domEnd !== -1) {
-        const pathEnd = scanAutolinkPath(s, domEnd, hasActiveBracket);
+        const pathEnd = scanAutolinkPath(s, domEnd, hasActiveBracket, i + 4);
         const text = s.slice(i, pathEnd);
         return { dest: 'http://' + text, text, len: pathEnd - i };
       }
@@ -1156,16 +1233,10 @@ function matchExtendedAutolink(s, i, hasActiveBracket) {
   if (!isAlnum) return null;
   const prev = i === 0 ? undefined : s[i - 1];
   if (prev !== undefined && EMAIL_LOCAL.test(prev)) return null;
-  // Scan the local part.
-  let j = i;
-  while (j < s.length && EMAIL_LOCAL.test(s[j])) j++;
-  if (j >= s.length || s[j] !== '@') return null;
-  const local = s.slice(i, j);
-  if (local.startsWith('.') || local.endsWith('.') || local.indexOf('..') !== -1) return null;
-  const domEnd = scanDomain(s, j + 1);
-  if (domEnd === -1) return null;
-  const text = s.slice(i, domEnd);
-  return { dest: 'mailto:' + text, text, len: domEnd - i };
+  const emEnd = scanEmail(s, i);
+  if (emEnd === -1) return null;
+  const text = s.slice(i, emEnd);
+  return { dest: 'mailto:' + text, text, len: emEnd - i };
 }
 
 // Emphasis resolution over nodes[startIdx..endIdx) using delims (entries
@@ -1191,9 +1262,11 @@ function processEmphasis(nodes, delims, startIdx, endIdx) {
       let opener = null;
       let oIdx = -1;
       // Nearest opener before the closer, same char, canOpen, len>0.
+      // '~' delimiters only match equal lengths.
       for (let k = delims.length - 1; k >= 0; k--) {
         const d = delims[k];
         if (d === closer || d.ch !== closer.ch || !d.canOpen || d.len <= 0) continue;
+        if (d.ch === '~' && d.len !== closer.len) continue;
         const di = nodes.indexOf(d.node);
         if (di < startIdx || di >= cIdx) continue;
         opener = d;
@@ -1201,11 +1274,13 @@ function processEmphasis(nodes, delims, startIdx, endIdx) {
         break;
       }
       if (!opener) break;
-      // Odd-match rule (+ ghost rule).
+      // Odd-match rule (+ ghost rule): if the sum of the lengths is a
+      // multiple of 3 and EITHER delimiter can both open and close, the
+      // pair must not match (unless both lengths are multiples of 3).
       let blocked = false;
       const sum = opener.len + closer.len;
       const bothMult3 = opener.len % 3 === 0 && closer.len % 3 === 0;
-      if (closer.canOpen && sum % 3 === 0 && !bothMult3) blocked = true;
+      if ((closer.canOpen || opener.canClose) && sum % 3 === 0 && !bothMult3) blocked = true;
       if (!blocked && !closer.canOpen) {
         // Ghost rule: a consumed delimiter between opener and closer,
         // with closer.len <= ghost.origLen, enables the rule-of-3.
@@ -1231,6 +1306,7 @@ function processEmphasis(nodes, delims, startIdx, endIdx) {
         for (let k = delims.length - 1; k >= 0; k--) {
           const d = delims[k];
           if (d === closer || d.ch !== closer.ch || !d.canOpen || d.len <= 0) continue;
+          if (d.ch === '~' && d.len !== closer.len) continue;
           if (closer._skip.has(d)) continue;
           const di = nodes.indexOf(d.node);
           if (di < startIdx || di >= cIdx) continue;
@@ -1243,7 +1319,7 @@ function processEmphasis(nodes, delims, startIdx, endIdx) {
         // Re-check the odd-match rule for the new opener.
         const sum2 = opener.len + closer.len;
         const both2 = opener.len % 3 === 0 && closer.len % 3 === 0;
-        if (closer.canOpen && sum2 % 3 === 0 && !both2) {
+        if ((closer.canOpen || opener.canClose) && sum2 % 3 === 0 && !both2) {
           closer._skip.add(opener);
           continue;
         }
@@ -1260,9 +1336,9 @@ function processEmphasis(nodes, delims, startIdx, endIdx) {
           if (gb) { closer._skip.add(opener); continue; }
         }
       }
-      // Match: use 2 if both have >= 2, else 1.
+      // Match: use 2 if both have >= 2, else 1. '~' always makes <del>.
       const use = (opener.len >= 2 && closer.len >= 2) ? 2 : 1;
-      const kind = use === 2 ? (opener.ch === '~' ? 'del' : 'strong') : 'em';
+      const kind = opener.ch === '~' ? 'del' : (use === 2 ? 'strong' : 'em');
       // Record ghosts for the consumed delimiters.
       ghosts.push({ node: opener.node, origLen: opener.len, ch: opener.ch });
       ghosts.push({ node: closer.node, origLen: closer.len, ch: closer.ch });
@@ -1278,6 +1354,68 @@ function processEmphasis(nodes, delims, startIdx, endIdx) {
       // Continue: the closer may match another opener.
     }
   }
+}
+
+// Try to match an image starting at s[i] === '!['. Scans the label with
+// nesting-aware bracket counting (so the OUTERMOST image wins — inner
+// ']'s must not claim the brackets first), then parses an inline,
+// full/collapsed, or shortcut tail. Returns {label, dest, title, next}
+// or null (caller falls back to the bracket mechanism).
+function matchImage(s, i, refs) {
+  let j = i + 2;
+  let depth = 0;
+  let close = -1;
+  while (j < s.length) {
+    const c = s[j];
+    if (c === '\\' && j + 1 < s.length && isPunct(s[j + 1])) { j += 2; continue; }
+    if (c === '[') { depth++; j++; continue; }
+    if (c === ']') {
+      if (depth === 0) { close = j; break; }
+      depth--; j++; continue;
+    }
+    j++;
+    if (j - i > 1000) return null;
+  }
+  if (close === -1) return null;
+  const label = s.slice(i + 2, close);
+  const next = close + 1;
+  // Inline tail: (dest "title")
+  if (s[next] === '(') {
+    let p = next + 1;
+    while (p < s.length && (s[p] === ' ' || s[p] === '\t' || s[p] === '\n')) p++;
+    let dest = null;
+    let title = null;
+    const dRes = parseLinkDest(s, p);
+    if (dRes) { dest = dRes[0]; p = dRes[1]; }
+    else if (p < s.length && (s[p] === ')' || s[p] === '"' || s[p] === "'" || s[p] === '(')) dest = '';
+    if (dest !== null) {
+      let t = p;
+      while (t < s.length && (s[t] === ' ' || s[t] === '\t' || s[t] === '\n')) t++;
+      if (t < s.length && (s[t] === '"' || s[t] === "'" || s[t] === '(')) {
+        const tRes = parseLinkTitle(s, t);
+        if (tRes) { title = tRes[0]; t = tRes[1]; }
+      }
+      while (t < s.length && (s[t] === ' ' || s[t] === '\t' || s[t] === '\n')) t++;
+      if (t < s.length && s[t] === ')') return { label, dest, title, next: t + 1 };
+    }
+    // Failed inline: fall back to a shortcut reference.
+    const ref = refs[normalizeLabel(label)];
+    if (ref) return { label, dest: ref.dest, title: ref.title, next: close + 1 };
+    return null;
+  }
+  // Full / collapsed reference tail.
+  if (s[next] === '[') {
+    const lab = parseLinkLabel(s, next);
+    if (lab) {
+      const ref = refs[normalizeLabel(lab[0] === '' ? label : lab[0])];
+      if (ref) return { label, dest: ref.dest, title: ref.title, next: lab[1] };
+    }
+    return null;
+  }
+  // Shortcut reference.
+  const ref = refs[normalizeLabel(label)];
+  if (ref) return { label, dest: ref.dest, title: ref.title, next: close + 1 };
+  return null;
 }
 
 // Parse inline content into a node list, then render to HTML.
@@ -1297,7 +1435,14 @@ function parseInline(src, refs) {
     // Backslash escapes / hard break.
     if (c === '\\' && i + 1 < n) {
       const nx = s[i + 1];
-      if (nx === '\n') { flush(); nodes.push({ t: 'br' }); i += 2; continue; }
+      if (nx === '\n') {
+        flush();
+        nodes.push({ t: 'br' });
+        i += 2;
+        // A hard break skips leading spaces/tabs on the next line.
+        while (i < n && (s[i] === ' ' || s[i] === '\t')) i++;
+        continue;
+      }
       if (isPunct(nx)) { buf += nx; i += 2; continue; }
       buf += c; i++; continue;
     }
@@ -1365,6 +1510,14 @@ function parseInline(src, refs) {
     }
     // Images / links: '![' or '['.
     if (c === '!' && i + 1 < n && s[i + 1] === '[') {
+      // Greedy image pre-pass: match the OUTERMOST image first.
+      const img = matchImage(s, i, refs);
+      if (img) {
+        flush();
+        nodes.push({ t: 'image', dest: img.dest, title: img.title, children: parseInline(img.label, refs) });
+        i = img.next;
+        continue;
+      }
       flush();
       const node = { t: 'bracket', image: true };
       nodes.push(node);
@@ -1416,6 +1569,12 @@ function parseInline(src, refs) {
           }
           while (t < n && (s[t] === ' ' || s[t] === '\t' || s[t] === '\n')) t++;
           if (t < n && s[t] === ')') { formed = true; next = t + 1; }
+        }
+        if (!formed) {
+          // A failed inline link falls back to a shortcut reference.
+          const label = s.slice(br.srcStart + 1, i);
+          const ref = refs[normalizeLabel(label)];
+          if (ref) { dest = ref.dest; title = ref.title; formed = true; next = i + 1; }
         }
       } else if (s[next] === '[') {
         const lab = parseLinkLabel(s, next);
@@ -1482,12 +1641,14 @@ function parseInline(src, refs) {
       i = j;
       continue;
     }
-    // Strikethrough delimiters ~~ (exactly 2).
+    // Strikethrough delimiters: runs of 1 or 2 '~' (runs of 3+ are
+    // literal). Single '~' also makes <del>; pairs must be equal length
+    // (enforced in processEmphasis).
     if (c === '~') {
       let j = i;
       while (j < n && s[j] === '~') j++;
       const len = j - i;
-      if (len === 2) {
+      if (len === 1 || len === 2) {
         const prev = i === 0 ? undefined : s[i - 1];
         const nextCh = j >= n ? undefined : s[j];
         const prevSpace = isUniSpace(prev);
@@ -1497,9 +1658,9 @@ function parseInline(src, refs) {
         const leftFlanking = !nextSpace && (!nextPunct || prevSpace || prevPunct);
         const rightFlanking = !prevSpace && (!prevPunct || nextSpace || nextPunct);
         flush();
-        const node = { t: 'delim', ch: '~', len: 2, canOpen: leftFlanking, canClose: rightFlanking };
+        const node = { t: 'delim', ch: '~', len, canOpen: leftFlanking, canClose: rightFlanking };
         nodes.push(node);
-        delims.push({ node, ch: '~', len: 2, canOpen: leftFlanking, canClose: rightFlanking });
+        delims.push({ node, ch: '~', len, canOpen: leftFlanking, canClose: rightFlanking });
         i = j;
         continue;
       }
@@ -1517,9 +1678,15 @@ function parseInline(src, refs) {
         const m = last.s.match(/ {2,}$/);
         if (m) { last.s = last.s.slice(0, -m[0].length); hard = true; }
       }
-      if (hard) nodes.push({ t: 'br' });
-      else buf += '\n';
-      i++;
+      if (hard) {
+        nodes.push({ t: 'br' });
+        i++;
+        // A hard break skips leading spaces/tabs on the next line.
+        while (i < n && (s[i] === ' ' || s[i] === '\t')) i++;
+      } else {
+        buf += '\n';
+        i++;
+      }
       continue;
     }
     // Extended autolinks (suppressed inside an unclosed <a>).
