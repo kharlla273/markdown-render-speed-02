@@ -1160,17 +1160,39 @@ function scanDomain(s, i, requireDot, allowUnderscoreStart) {
 }
 // Scan an email address starting at s[i] (local-part start). Returns the
 // end index (exclusive) or -1. The domain needs a dot and must not end
-// with '-' or '_'.
-function scanEmail(s, i) {
+// with '-' or '_'. When trimUnderscore is set (an unmatched '_' opener
+// exists earlier, so a trailing '_' run is an emphasis closer, not
+// domain text), trailing '_'s are trimmed from the domain instead of
+// rejecting the email — but only if the run can close.
+function scanEmail(s, i, trimUnderscore) {
   let j = i;
   while (j < s.length && EMAIL_LOCAL.test(s[j])) j++;
   if (j >= s.length || s[j] !== '@') return -1;
   const local = s.slice(i, j);
   if (local.length === 0 || local.startsWith('.') || local.endsWith('.') || local.indexOf('..') !== -1) return -1;
-  const domEnd = scanDomain(s, j + 1, true, true);
+  let domEnd = scanDomain(s, j + 1, true, true);
   if (domEnd === -1) return -1;
   const last = s[domEnd - 1];
-  if (last === '-' || last === '_') return -1;
+  if (last === '-') return -1;
+  if (last === '_') {
+    if (!trimUnderscore) return -1;
+    // Trim the trailing '_' run if it can close as emphasis.
+    let runStart = domEnd;
+    while (runStart > j + 1 && s[runStart - 1] === '_') runStart--;
+    const prev = s[runStart - 1];
+    const next = domEnd >= s.length ? undefined : s[domEnd];
+    const prevSpace = isUniSpace(prev);
+    const nextSpace = isUniSpace(next);
+    const prevPunct = isUniPunct(prev);
+    const nextPunct = isUniPunct(next);
+    const leftFlanking = !nextSpace && (!nextPunct || prevSpace || prevPunct);
+    const rightFlanking = !prevSpace && (!prevPunct || nextSpace || nextPunct);
+    const canClose = rightFlanking && (!leftFlanking || nextPunct);
+    if (!canClose) return -1;
+    domEnd = runStart;
+    const last2 = s[domEnd - 1];
+    if (last2 === undefined || last2 === '-' || last2 === '_' || last2 === '.') return -1;
+  }
   return domEnd;
 }
 // Scan an xmpp path segment starting at s[i] (after the '/'). Segment
@@ -1270,7 +1292,7 @@ function scanAutolinkPath(s, i, hasActiveBracket, stripStart) {
 // case-insensitive; mailto: and xmpp: are lowercase-only. Then www.
 // (preceded by start/whitespace/punct, not '.'), then a bare email
 // (alnum at a word start). Returns {dest, text, len} or null.
-function matchExtendedAutolink(s, i, hasActiveBracket) {
+function matchExtendedAutolink(s, i, hasActiveBracket, trimEmailUnderscore) {
   // :// schemes.
   const low = s.slice(i, i + 8).toLowerCase();
   let urlSchemeLen = 0;
@@ -1291,7 +1313,7 @@ function matchExtendedAutolink(s, i, hasActiveBracket) {
   if (s.startsWith('mailto:', i) || s.startsWith('xmpp:', i)) {
     const isXmpp = s[i] === 'x';
     const after = i + (isXmpp ? 5 : 7);
-    const emEnd = scanEmail(s, after);
+    const emEnd = scanEmail(s, after, trimEmailUnderscore);
     if (emEnd !== -1) {
       let end = emEnd;
       if (isXmpp && s[end] === '/') {
@@ -1322,7 +1344,7 @@ function matchExtendedAutolink(s, i, hasActiveBracket) {
   if (!isAlnum) return null;
   const prev = i === 0 ? undefined : s[i - 1];
   if (prev !== undefined && EMAIL_LOCAL.test(prev)) return null;
-  const emEnd = scanEmail(s, i);
+  const emEnd = scanEmail(s, i, trimEmailUnderscore);
   if (emEnd === -1) return null;
   const text = s.slice(i, emEnd);
   return { dest: 'mailto:' + text, text, len: emEnd - i };
@@ -1534,6 +1556,11 @@ function parseInline(src, refs, st) {
   const delims = [];
   const brackets = []; // {nodeIdx, active, image, srcStart}
   let buf = '';
+  // Counts of '_' openers/closers seen so far (for the email trim:
+  // more openers than closers means an unmatched '_' opener exists,
+  // so a trailing '_' run after an email domain is an emphasis closer).
+  let uOpen = 0;
+  let uClose = 0;
   st = st || { inAnchor: false };
   const flush = () => { if (buf.length > 0) { nodes.push({ t: 'text', s: buf }); buf = ''; } };
 
@@ -1749,6 +1776,7 @@ function parseInline(src, refs, st) {
       const node = { t: 'delim', ch: c, len, canOpen, canClose };
       nodes.push(node);
       delims.push({ node, ch: c, len, canOpen, canClose });
+      if (c === '_') { if (canOpen) uOpen++; if (canClose) uClose++; }
       i = j;
       continue;
     }
@@ -1803,7 +1831,7 @@ function parseInline(src, refs, st) {
     // Extended autolinks (suppressed inside an unclosed <a>).
     if (!st.inAnchor && (c === 'w' || ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')))) {
       const hasActiveBracket = brackets.some(b => b.active);
-      const ea = matchExtendedAutolink(s, i, hasActiveBracket);
+      const ea = matchExtendedAutolink(s, i, hasActiveBracket, uOpen > uClose);
       if (ea) {
         flush();
         nodes.push({ t: 'link', dest: ea.dest, title: null, children: textNodesWithEntities(ea.text), ext: true });
