@@ -29,9 +29,12 @@ function isSpaceOrTab(c) { return c === ' ' || c === '\t'; }
 const PUNCT = new Set('!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~'.split(''));
 function isPunct(c) { return c !== undefined && PUNCT.has(c); }
 // Unicode punctuation / whitespace tests (for flanking rules).
-// Punctuation includes Unicode Sc (currency symbols like $/£/€) — marked
-// treats them as punctuation for flanking.
-const RE_PUNCT = /[\p{P}\p{Sc}]/u;
+// Punctuation includes Unicode Sc (currency symbols like $/£/€) and
+// the ASCII punctuation chars that are not \p{P} (Sm/Sk: + < = > ^
+// ` | ~) — marked treats all ASCII punctuation as punctuation for
+// flanking, so e.g. '_' can close before '~' and open after a
+// backtick (a code-span boundary).
+const RE_PUNCT = /[\p{P}\p{Sc}+<=>^`|~]/u;
 const RE_SPACE = /\s/u;
 function isUniPunct(c) { return c !== undefined && RE_PUNCT.test(c); }
 function isUniSpace(c) { return c === undefined || RE_SPACE.test(c); }
@@ -916,7 +919,17 @@ function parseBlocks(src) {
       // List start
       const li = matchList(rest);
       if (li) {
-        const canInterrupt = !li.empty && (!paraOpen || !li.ordered || li.start === 1);
+        // Inside a list item, an ordered list with any start number
+        // interrupts a paragraph (marked re-lexes item content, so the
+        // start==1 rule does not apply there). A blockquote between
+        // the item and the paragraph restores the top-level rule.
+        let inItemPara = false;
+        for (let k = stack.length - 1; k >= 1; k--) {
+          const b = stack[k];
+          if (b.t === 'quote') break;
+          if (b.t === 'item') { inItemPara = true; break; }
+        }
+        const canInterrupt = !li.empty && (!paraOpen || !li.ordered || li.start === 1 || inItemPara);
         if (canInterrupt || !paraOpen) {
           closeLeaf();
           // Find or create the list in this container.
@@ -1195,6 +1208,11 @@ function scanAutolinkPath(s, i, hasActiveBracket, stripStart) {
       if (s[k] === '(') { end = k; break; }
     }
   }
+  // (b) and (c) interact: stripping trailing punctuation can reveal a
+  // trailing ')', so repeat both until the end stops moving.
+  let prevEnd = -1;
+  while (prevEnd !== end) {
+    prevEnd = end;
   // (b) Trailing ')': after the last '(' at most one ')' may remain.
   let lastOpen = -1;
   for (let k = end - 1; k >= segStart; k--) {
@@ -1221,6 +1239,7 @@ function scanAutolinkPath(s, i, hasActiveBracket, stripStart) {
       continue;
     }
     break;
+  }
   }
   return end;
 }
@@ -1401,6 +1420,22 @@ function processEmphasis(nodes, delims, startIdx, endIdx) {
       const emNode = { t: kind, children };
       nodes.splice(oIdx + 1, cIdx - oIdx - 1, emNode);
       // Continue: the closer may match another opener.
+    }
+  }
+}
+
+// Remove extended-autolink nodes from a node list (marked never
+// creates them inside a link label); each is replaced by its text
+// children. Recurses into em/strong/del/link/image children.
+function unlinkExtended(nodes) {
+  for (let k = 0; k < nodes.length; k++) {
+    const nd = nodes[k];
+    if (nd.t === 'link' && nd.ext) {
+      const m = nd.children.length;
+      nodes.splice(k, 1, ...nd.children);
+      k += m - 1;
+    } else if (nd.children) {
+      unlinkExtended(nd.children);
     }
   }
 }
@@ -1652,6 +1687,8 @@ function parseInline(src, refs, st) {
         processEmphasis(nodes, delims, bNodeIdx + 1, nodes.length);
         const children = nodes.splice(bNodeIdx, nodes.length - bNodeIdx);
         children.shift(); // remove the bracket node
+        // Extended autolinks never survive inside a link label.
+        unlinkExtended(children);
         if (br.image) {
           nodes.push({ t: 'image', dest, title, children });
         } else {
@@ -1748,7 +1785,7 @@ function parseInline(src, refs, st) {
       const ea = matchExtendedAutolink(s, i, hasActiveBracket);
       if (ea) {
         flush();
-        nodes.push({ t: 'link', dest: ea.dest, title: null, children: textNodesWithEntities(ea.text) });
+        nodes.push({ t: 'link', dest: ea.dest, title: null, children: textNodesWithEntities(ea.text), ext: true });
         i += ea.len;
         continue;
       }
