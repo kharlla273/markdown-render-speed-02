@@ -1011,11 +1011,13 @@ function matchInlineHtml(s, i) {
   if (m) return m[0];
   m = rest.match(/^<!\[CDATA\[[\s\S]*?\]\]>/);
   if (m) return m[0];
-  m = rest.match(/^<\/?[A-Za-z][A-Za-z0-9-]*(?:\s+[^<>]*)?\/?>/);
-  if (m) {
-    // Attribute values must be well-formed enough: no bare '<' inside.
-    return m[0];
-  }
+  // Open tag: strict CommonMark grammar (attribute names/values must
+  // be well-formed; quoted values may contain < and >).
+  m = rest.match(/^<[A-Za-z][A-Za-z0-9-]*(\s+[A-Za-z_:][A-Za-z0-9_.:-]*(\s*=\s*('[^']*'|"[^"]*"|[^\s"'=<>`]+))?)*\s*\/?>/);
+  if (m) return m[0];
+  // Close tag: no attributes allowed.
+  m = rest.match(/^<\/[A-Za-z][A-Za-z0-9-]*\s*>/);
+  if (m) return m[0];
   return null;
 }
 
@@ -1434,29 +1436,20 @@ function parseInline(src, refs) {
       }
       if (formed) {
         flush(); // the link text may still be buffered; it belongs in the nodes
-        // Backtick rule: a code span in the link text blocks the link
-        // unless it is the final node of the text.
-        const textNodes = nodes.slice(bNodeIdx + 1);
-        let blocked = false;
-        for (let q = 0; q < textNodes.length; q++) {
-          if (textNodes[q].t === 'code' && q !== textNodes.length - 1) { blocked = true; break; }
+        // Resolve emphasis inside the link text first.
+        processEmphasis(nodes, delims, bNodeIdx + 1, nodes.length);
+        const children = nodes.splice(bNodeIdx, nodes.length - bNodeIdx);
+        children.shift(); // remove the bracket node
+        if (br.image) {
+          nodes.push({ t: 'image', dest, title, children });
+        } else {
+          nodes.push({ t: 'link', dest, title, children });
+          // A link deactivates all earlier brackets (no nested links).
+          for (let b = 0; b < bi; b++) brackets[b].active = false;
         }
-        if (!blocked) {
-          // Resolve emphasis inside the link text first.
-          processEmphasis(nodes, delims, bNodeIdx + 1, nodes.length);
-          const children = nodes.splice(bNodeIdx, nodes.length - bNodeIdx);
-          children.shift(); // remove the bracket node
-          if (br.image) {
-            nodes.push({ t: 'image', dest, title, children });
-          } else {
-            nodes.push({ t: 'link', dest, title, children });
-            // A link deactivates all earlier brackets (no nested links).
-            for (let b = 0; b < bi; b++) brackets[b].active = false;
-          }
-          brackets.splice(bi, 1);
-          i = next;
-          continue;
-        }
+        brackets.splice(bi, 1);
+        i = next;
+        continue;
       }
       // No link formed: deactivate this bracket; ']' is literal.
       br.active = false;
