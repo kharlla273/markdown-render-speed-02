@@ -637,13 +637,16 @@ function parseBlocks(src) {
     if (!align) return false;
     return align.length === splitTableRow(para.lines[0]).length;
   }
-  // Should an HTML block closing on line `ln` end with a newline? Yes
-  // iff the next line continues this container with non-blank content,
-  // or the block closes on the final line and the source ends with \n.
+  // Should an HTML block (types 1-5 only; types 6-7 never call this)
+  // closing on line `ln` end with a newline? Yes iff the next line, as
+  // seen inside this container, is non-empty — a whitespace-only line
+  // still counts (only a truly empty line, or the container closing,
+  // drops it) — or the block closes on the final line and the source
+  // ends with \n.
   function htmlTrailingNl(ln) {
     if (ln + 1 >= lines.length) return srcEndsWithNewline;
     const nextRest = lineMatchesContainers(lines[ln + 1]);
-    return nextRest !== null && !isBlank(nextRest);
+    return nextRest !== null && nextRest.length > 0;
   }
   function lineMatchesContainers(line) {
     let r = line;
