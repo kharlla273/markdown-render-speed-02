@@ -630,6 +630,13 @@ function parseBlocks(src) {
     const leaf = topLeaf();
     if (leaf) { stack.pop(); finalize(leaf); }
   }
+  // Is this open paragraph a (future) table? Same test as finalize().
+  function isTablePara(para) {
+    if (!para || para.t !== 'para' || para.lines.length < 2) return false;
+    const align = parseTableDelim(para.lines[1]);
+    if (!align) return false;
+    return align.length === splitTableRow(para.lines[0]).length;
+  }
   // Should an HTML block closing on line `ln` end with a newline? Yes
   // iff the next line continues this container with non-blank content,
   // or the block closes on the final line and the source ends with \n.
@@ -822,6 +829,14 @@ function parseBlocks(src) {
         container = stack[stack.length - 1];
       }
       if (isBlank(rest)) {
+        // A line of 0-3 spaces + exactly one tab inside a table is an
+        // empty row, not a blank line (marked quirk: a tab-only line
+        // is a row, while space-only or multi-tab lines end the table).
+        const para0 = topLeaf();
+        if (para0 && para0.t === 'para' && /^ {0,3}\t$/.test(rest) && isTablePara(para0)) {
+          para0.lines.push(rest);
+          break;
+        }
         // A line that is blank only after container markers were
         // stripped (rest is whitespace but non-empty, raw line not
         // blank) is the paragraph's last content line when nothing
