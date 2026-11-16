@@ -2112,8 +2112,25 @@ function parseInline(src, refs, st) {
         }
       }
     }
-    buf += c;
-    i++;
+    // Plain text: fast path for a mid-word alphanumeric run. No branch
+    // can trigger inside it (scheme starts h/H/f/F/m/x break the run
+    // and are handled by the autolink gate above; word starts can't
+    // occur mid-word since the previous char is alphanumeric), so
+    // bulk-append the run instead of one char per loop iteration.
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+      let j = i + 1;
+      while (j < n) {
+        const d = s[j];
+        if (!((d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z') || (d >= '0' && d <= '9'))) break;
+        if (d === 'h' || d === 'H' || d === 'f' || d === 'F' || d === 'm' || d === 'x') break;
+        j++;
+      }
+      buf += s.slice(i, j);
+      i = j;
+    } else {
+      buf += c;
+      i++;
+    }
   }
   flush();
   // Resolve emphasis over the whole node list.
