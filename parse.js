@@ -744,7 +744,13 @@ function parseBlocks(src) {
       // the line is reprocessed as new content in the item; otherwise
       // the line is fence content — Phase 2 handles it (closing check
       // + indent strip) with the rest as matched up to the failure.
+      // Two exceptions (oracle-verified): when the fence has no
+      // content lines yet, a dedented line ends the empty fence and
+      // the item; and when the line is itself a fence line, it cannot
+      // close this fence from outside the item — the fence closes
+      // implicitly and the line opens a new fence at the outer level.
       if (quoteFailInsideItem !== -1) closeTo(quoteFailInsideItem);
+      else if (leaf.lines.length === 0 || matchFenceStart(rest)) closeTo(failAt);
     } else if (failAt !== -1) {
       // Lazy continuation? Only for an open paragraph + a line that is
       // non-blank AS SEEN INSIDE the matched containers (a '>' line
