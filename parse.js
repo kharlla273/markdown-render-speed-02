@@ -95,6 +95,21 @@ function stripCols(line, n, from = 0) {
   }
   return expandLeadingTabs(line.slice(j), col);
 }
+// Strip n columns from code content (indented code, backtick fence
+// content): a tab encountered while col < n is consumed ENTIRELY even
+// if it extends past n (marked quirk: strip 2 from "\tfoo" -> "foo"),
+// and the remainder is kept VERBATIM (tabs are not expanded).
+function stripCodeCols(line, n, from = 0) {
+  let col = 0;
+  let j = from;
+  while (j < line.length && col < n) {
+    const c = line[j];
+    if (c === ' ') { col++; j++; }
+    else if (c === '\t') { col += 4 - (col % 4); j++; }
+    else break;
+  }
+  return line.slice(j);
+}
 // Expand tabs in the leading whitespace run of s to spaces, with tab
 // stops every 4 columns counting from startCol (the column where s
 // starts in the original line). Content tabs are left untouched.
@@ -238,6 +253,7 @@ function matchQuote(line) {
   let i = 0;
   while (i < line.length && i < 3 && line[i] === ' ') i++;
   if (line[i] !== '>') return null;
+  const gt = i;
   i++;
   if (line[i] === ' ') i++;
   else if (line[i] === '\t') {
@@ -246,7 +262,10 @@ function matchQuote(line) {
     const w = 4 - (i % 4);
     return ' '.repeat(w - 1) + expandLeadingTabs(line.slice(i + 1), i + w);
   }
-  return line.slice(i);
+  // Expand leading tabs of the remainder with the column grid
+  // restarting at the '>' marker (marked quirk: '> \t' -> 2 spaces,
+  // and '> \tfoo' is a paragraph, not indented code).
+  return expandLeadingTabs(line.slice(i), i - gt);
 }
 
 // Match a fenced code start. Returns {ch, len, info, indent} or null.
@@ -648,15 +667,32 @@ function parseBlocks(src) {
     let rest = line;
     let failAt = -1;
     const leaf = topLeaf();
+    const leafIsFenced = leaf && leaf.t === 'code' && leaf.fenced;
     const topIdx = stack.length - (leaf ? 1 : 0);
     const blankItems = []; // items this blank line was seen inside
+    // Fenced-code forgiveness (oracle-verified): when the open leaf is a
+    // fenced code block, a line that fails a LIST ITEM's indent does not
+    // close the item — it is fence content. A quote inside such an item
+    // still closes if the line lacks its marker. Once a container has
+    // failed, `rest` is frozen (later matches are provisional, only used
+    // to detect an item failure); the fence-content path uses the rest
+    // as matched up to the first failure.
+    let itemFailIdx = -1;
+    let quoteFailInsideItem = -1;
+    let frozen = false;
     for (let k = 1; k < topIdx; k++) {
       const b = stack[k];
       if (b.t === 'list') continue;
       if (b.t === 'quote') {
         const m = matchQuote(rest);
-        if (m === null) { failAt = k; break; }
-        rest = m;
+        if (m === null) {
+          if (failAt === -1) failAt = k;
+          if (!leafIsFenced) break;
+          if (itemFailIdx !== -1) { quoteFailInsideItem = k; break; }
+          frozen = true;
+          continue;
+        }
+        if (!frozen) rest = m;
       } else if (b.t === 'item') {
         if (isBlank(rest)) {
           // An item with no content yet cannot contain a blank line:
@@ -667,8 +703,14 @@ function parseBlocks(src) {
         }
         const ind = indentWidth(rest);
         if (ind.cols >= b._indent) {
-          rest = stripCols(rest, b._indent);
-        } else { failAt = k; break; }
+          if (!frozen) rest = stripCols(rest, b._indent);
+        } else {
+          if (failAt === -1) failAt = k;
+          if (!leafIsFenced) break;
+          if (itemFailIdx === -1) itemFailIdx = k;
+          frozen = true;
+          continue;
+        }
       }
     }
     // A blank line belongs to every item it was seen inside; the
@@ -683,7 +725,14 @@ function parseBlocks(src) {
         for (const it of blankItems) it._pendingBlank = true;
       }
     }
-    if (failAt !== -1) {
+    if (leafIsFenced && itemFailIdx !== -1) {
+      // Fenced-code forgiveness: the item stays open. A quote inside
+      // the failed item still closes (the fence closes with it) and
+      // the line is reprocessed as new content in the item; otherwise
+      // the line is fence content — Phase 2 handles it (closing check
+      // + indent strip) with the rest as matched up to the failure.
+      if (quoteFailInsideItem !== -1) closeTo(quoteFailInsideItem);
+    } else if (failAt !== -1) {
       // Lazy continuation? Only for an open paragraph + non-blank line,
       // and NOT a line that starts a new block: a list item, a fenced
       // code block, an ATX heading, a thematic break, or an HTML block
@@ -722,7 +771,7 @@ function parseBlocks(src) {
       if (closing) { closeLeaf(); continue; }
       // Content: backtick fences strip up to the opening indent;
       // tilde fences strip nothing (marked quirk).
-      cur.lines.push(cur.fenceCh === '~' ? rest : stripCols(rest, cur.fenceIndent));
+      cur.lines.push(cur.fenceCh === '~' ? rest : stripCodeCols(rest, cur.fenceIndent));
       continue;
     }
     if (cur && cur.t === 'html') {
@@ -743,9 +792,9 @@ function parseBlocks(src) {
       }
     }
     if (cur && cur.t === 'code' && !cur.fenced) {
-      if (isBlank(rest)) { cur.lines.push(stripCols(rest, 4)); continue; }
+      if (isBlank(rest)) { cur.lines.push(stripCodeCols(rest, 4)); continue; }
       const ind = indentWidth(rest);
-      if (ind.cols >= 4) { cur.lines.push(stripCols(rest, 4)); continue; }
+      if (ind.cols >= 4) { cur.lines.push(stripCodeCols(rest, 4)); continue; }
       closeLeaf(); // dedented: close and reprocess as new block
       cur = null;
     }
@@ -901,7 +950,7 @@ function parseBlocks(src) {
       if (!paraOpen) {
         const ind = indentWidth(rest);
         if (ind.cols >= 4) {
-          const node = { t: 'code', fenced: false, lines: [stripCols(rest, 4)] };
+          const node = { t: 'code', fenced: false, lines: [stripCodeCols(rest, 4)] };
           container.children.push(node);
           stack.push(node);
           break;
@@ -1419,13 +1468,17 @@ function matchImage(s, i, refs) {
 }
 
 // Parse inline content into a node list, then render to HTML.
-function parseInline(src, refs) {
+// `st` is the shared renderer state ({inAnchor}): an unclosed inline
+// <a> suppresses extended autolinks in ALL following blocks, not just
+// the current one (marked behaviour — the state is threaded through
+// the renderer in document order).
+function parseInline(src, refs, st) {
   const s = src;
   const nodes = [];
   const delims = [];
   const brackets = []; // {nodeIdx, active, image, srcStart}
   let buf = '';
-  let inAnchor = false;
+  st = st || { inAnchor: false };
   const flush = () => { if (buf.length > 0) { nodes.push({ t: 'text', s: buf }); buf = ''; } };
 
   let i = 0;
@@ -1494,8 +1547,8 @@ function parseInline(src, refs) {
         flush();
         nodes.push({ t: 'html', s: html });
         const low = html.toLowerCase();
-        if (/^<a(\s|\/?>)/.test(low)) inAnchor = true;
-        else if (low.startsWith('</a')) inAnchor = false;
+        if (/^<a(\s|\/?>)/.test(low)) st.inAnchor = true;
+        else if (/^<\/a(\s|>)/.test(low)) st.inAnchor = false;
         i += html.length;
         continue;
       }
@@ -1514,7 +1567,7 @@ function parseInline(src, refs) {
       const img = matchImage(s, i, refs);
       if (img) {
         flush();
-        nodes.push({ t: 'image', dest: img.dest, title: img.title, children: parseInline(img.label, refs) });
+        nodes.push({ t: 'image', dest: img.dest, title: img.title, children: parseInline(img.label, refs, st) });
         i = img.next;
         continue;
       }
@@ -1690,7 +1743,7 @@ function parseInline(src, refs) {
       continue;
     }
     // Extended autolinks (suppressed inside an unclosed <a>).
-    if (!inAnchor && (c === 'w' || ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')))) {
+    if (!st.inAnchor && (c === 'w' || ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')))) {
       const hasActiveBracket = brackets.some(b => b.active);
       const ea = matchExtendedAutolink(s, i, hasActiveBracket);
       if (ea) {
@@ -1761,7 +1814,7 @@ function plainText(nodes) {
 }
 
 // ================= BLOCK RENDERER =================
-function renderItem(item, tight, refs) {
+function renderItem(item, tight, refs, st) {
   let out = '<li>';
   const kids = item.children;
   let taskHtml = '';
@@ -1778,22 +1831,22 @@ function renderItem(item, tight, refs) {
   }
   if (tight && kids.length === 1 && kids[0].t === 'para') {
     const text = taskRest !== null ? taskRest : kids[0].lines.join('\n');
-    out += taskHtml + renderInline(parseInline(text, refs));
+    out += taskHtml + renderInline(parseInline(text, refs, st));
   } else {
     for (let k = 0; k < kids.length; k++) {
       const child = kids[k];
       if (k === 0 && child.t === 'para' && taskRest !== null) {
         if (tight) {
-          out += taskHtml + renderInline(parseInline(taskRest, refs));
+          out += taskHtml + renderInline(parseInline(taskRest, refs, st));
         } else {
-          out += '<p>' + taskHtml + renderInline(parseInline(taskRest, refs)) + '</p>\n';
+          out += '<p>' + taskHtml + renderInline(parseInline(taskRest, refs, st)) + '</p>\n';
         }
       } else if (child.t === 'para' && tight) {
         // Tight list: paragraph children render bare, no <p> wrapper
         // and no trailing newline (even with several blocks in the item).
-        out += renderInline(parseInline(child.lines.join('\n'), refs));
+        out += renderInline(parseInline(child.lines.join('\n'), refs, st));
       } else {
-        out += renderBlock(child, refs);
+        out += renderBlock(child, refs, st);
       }
     }
   }
@@ -1801,12 +1854,12 @@ function renderItem(item, tight, refs) {
   return out;
 }
 
-function renderBlock(node, refs) {
+function renderBlock(node, refs, st) {
   switch (node.t) {
     case 'para':
-      return '<p>' + renderInline(parseInline(node.lines.join('\n'), refs)) + '</p>\n';
+      return '<p>' + renderInline(parseInline(node.lines.join('\n'), refs, st)) + '</p>\n';
     case 'head':
-      return '<h' + node.level + '>' + renderInline(parseInline(node.text, refs)) + '</h' + node.level + '>\n';
+      return '<h' + node.level + '>' + renderInline(parseInline(node.text, refs, st)) + '</h' + node.level + '>\n';
     case 'code': {
       let cls = '';
       if (node.info) {
@@ -1819,7 +1872,7 @@ function renderBlock(node, refs) {
     case 'html':
       return node.text;
     case 'quote':
-      return '<blockquote>\n' + node.children.map(c => renderBlock(c, refs)).join('') + '</blockquote>\n';
+      return '<blockquote>\n' + node.children.map(c => renderBlock(c, refs, st)).join('') + '</blockquote>\n';
     case 'list': {
       const tag = node.ordered ? 'ol' : 'ul';
       const start = node.ordered && node.start !== 1 ? ' start="' + node.start + '"' : '';
@@ -1833,7 +1886,7 @@ function renderBlock(node, refs) {
         if (it._blankAfter && k < node.items.length - 1) { tight = false; break; }
       }
       let out = '<' + tag + start + '>\n';
-      for (const it of node.items) out += renderItem(it, tight, refs);
+      for (const it of node.items) out += renderItem(it, tight, refs, st);
       out += '</' + tag + '>\n';
       return out;
     }
@@ -1841,7 +1894,7 @@ function renderBlock(node, refs) {
       let out = '<table>\n<thead>\n<tr>\n';
       for (let k = 0; k < node.header.length; k++) {
         const a = node.align[k];
-        out += '<th' + (a ? ' align="' + a + '"' : '') + '>' + renderInline(parseInline(node.header[k], refs)) + '</th>\n';
+        out += '<th' + (a ? ' align="' + a + '"' : '') + '>' + renderInline(parseInline(node.header[k], refs, st)) + '</th>\n';
       }
       out += '</tr>\n</thead>\n';
       if (node.rows.length > 0) {
@@ -1850,7 +1903,7 @@ function renderBlock(node, refs) {
           out += '<tr>\n';
           for (let k = 0; k < row.length; k++) {
             const a = node.align[k];
-            out += '<td' + (a ? ' align="' + a + '"' : '') + '>' + renderInline(parseInline(row[k], refs)) + '</td>\n';
+            out += '<td' + (a ? ' align="' + a + '"' : '') + '>' + renderInline(parseInline(row[k], refs, st)) + '</td>\n';
           }
           out += '</tr>\n';
         }
@@ -1868,7 +1921,8 @@ function renderBlock(node, refs) {
 
 export function parse(src) {
   const { doc, refs } = parseBlocks(src);
+  const st = { inAnchor: false };
   let out = '';
-  for (const c of doc.children) out += renderBlock(c, refs);
+  for (const c of doc.children) out += renderBlock(c, refs, st);
   return out;
 }
