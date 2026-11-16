@@ -262,6 +262,35 @@ function labelBackticksValid(label) {
   return lastLen >= 2 && lastEnd === label.length;
 }
 
+// Count the backtick runs in a label that do NOT pair into a code span
+// (greedy code-span pairing: a run pairs with the next run of the same
+// length, and runs inside a formed span are consumed). Backslash-escaped
+// backticks don't count. A formed inline link/image whose label has >= 2
+// unmatched runs triggers emphasis suppression later in the paragraph
+// (oracle-probed).
+function countUnmatchedBacktickRuns(label) {
+  const runs = [];
+  for (let k = 0; k < label.length; k++) {
+    if (label[k] === '\\' && k + 1 < label.length && isPunct(label[k + 1])) { k++; continue; }
+    if (label[k] === '`') {
+      let e = k;
+      while (e < label.length && label[e] === '`') e++;
+      runs.push(e - k);
+      k = e - 1;
+    }
+  }
+  let unmatched = 0;
+  let i = 0;
+  while (i < runs.length) {
+    let paired = false;
+    for (let j = i + 1; j < runs.length; j++) {
+      if (runs[j] === runs[i]) { i = j + 1; paired = true; break; }
+    }
+    if (!paired) { unmatched++; i++; }
+  }
+  return unmatched;
+}
+
 // Does a valid link tail start at s[p] (the char after a ']' whose label
 // is `label`)? Mirrors the ']' handler: inline tail (with shortcut
 // fallback on failure), full/collapsed ref tail, or shortcut ref.
@@ -1652,7 +1681,7 @@ function matchImage(s, i, refs) {
         if (tRes) { title = tRes[0]; t = tRes[1]; }
       }
       while (t < s.length && (s[t] === ' ' || s[t] === '\t' || s[t] === '\n')) t++;
-      if (t < s.length && s[t] === ')') return { label, dest, title, next: t + 1 };
+      if (t < s.length && s[t] === ')') return { label, dest, title, next: t + 1, inline: true };
     }
     // Failed inline: fall back to a shortcut reference.
     const ref = refs[normalizeLabel(label)];
@@ -1692,6 +1721,34 @@ function parseInline(src, refs, st) {
   let uClose = 0;
   st = st || { inAnchor: false };
   const flush = () => { if (buf.length > 0) { nodes.push({ t: 'text', s: buf }); buf = ''; } };
+  // Backtick-label emphasis suppression (oracle-probed): once an INLINE
+  // link/image forms whose label holds >= 2 backtick runs that don't pair
+  // into a code span, emphasis after it in this paragraph stays literal —
+  // but only pairs with a backtick after the closer (a backtick between
+  // opener and closer does not suppress, so only closers are marked; a
+  // suppressed closer kills its pair). Ref links never trigger.
+  let btTriggerAt = -1; // source index just past the first trigger link
+  let lastBtCache = null; // last unescaped backtick in this paragraph
+  const applyBtSuppression = () => {
+    if (btTriggerAt === -1) return;
+    if (lastBtCache === null) {
+      let lastBt = -1;
+      for (let k = s.length - 1; k >= 0; k--) {
+        if (s[k] === '`') {
+          let bs = 0;
+          for (let q = k - 1; q >= 0 && s[q] === '\\'; q--) bs++;
+          if (bs % 2 === 0) { lastBt = k; break; }
+        }
+      }
+      lastBtCache = lastBt;
+    }
+    if (lastBtCache === -1) return;
+    for (const d of delims) {
+      if (!d.suppressed && d.canClose && (d.ch === '*' || d.ch === '_') && d.pos >= btTriggerAt && d.pos < lastBtCache) {
+        d.suppressed = true;
+      }
+    }
+  };
 
   let i = 0;
   const n = s.length;
@@ -1795,6 +1852,7 @@ function parseInline(src, refs, st) {
       if (img) {
         flush();
         nodes.push({ t: 'image', dest: img.dest, title: img.title, children: parseInline(img.label, refs, st) });
+        if (img.inline && btTriggerAt === -1 && countUnmatchedBacktickRuns(img.label) >= 2) btTriggerAt = img.next;
         i = img.next;
         continue;
       }
@@ -1888,7 +1946,9 @@ function parseInline(src, refs, st) {
       }
       if (formed) {
         flush(); // the link text may still be buffered; it belongs in the nodes
-        // Resolve emphasis inside the link text first.
+        // Resolve emphasis inside the link text first (applying any
+        // backtick-label suppression from an earlier trigger link).
+        applyBtSuppression();
         processEmphasis(nodes, delims, bNodeIdx + 1, nodes.length);
         const children = nodes.splice(bNodeIdx, nodes.length - bNodeIdx);
         children.shift(); // remove the bracket node
@@ -1901,6 +1961,7 @@ function parseInline(src, refs, st) {
           // A link deactivates all earlier brackets (no nested links).
           for (let b = 0; b < bi; b++) brackets[b].active = false;
         }
+        if (inlineTail && btTriggerAt === -1 && countUnmatchedBacktickRuns(labelText) >= 2) btTriggerAt = next;
         brackets.splice(bi, 1);
         i = next;
         continue;
@@ -1932,7 +1993,7 @@ function parseInline(src, refs, st) {
       flush();
       const node = { t: 'delim', ch: c, len, canOpen, canClose };
       nodes.push(node);
-      delims.push({ node, ch: c, len, canOpen, canClose });
+      delims.push({ node, ch: c, len, canOpen, canClose, pos: i });
       if (c === '_') { if (canOpen) uOpen++; if (canClose) uClose++; }
       i = j;
       continue;
@@ -2001,6 +2062,7 @@ function parseInline(src, refs, st) {
   }
   flush();
   // Resolve emphasis over the whole node list.
+  applyBtSuppression();
   processEmphasis(nodes, delims, 0, nodes.length);
   return nodes;
 }
